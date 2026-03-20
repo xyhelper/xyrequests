@@ -26,6 +26,8 @@ type ClientOption struct {
 	ClientProfile      string      // 客户端配置文件名称
 	Spec               string      // goSpiderSpec 指纹字符串，不为空时优先使用
 	ForceHttp1         bool        // 强制使用HTTP/1.1（WebSocket场景需要设为true）
+	StrictFingerprint  bool        // 反向代理严格模式：为true时完全使用gospec的header，覆盖客户端的；为false时客户端header优先（默认）
+	PassthroughHeaders []string    // StrictFingerprint模式下允许透传的header列表。比如Authorization、X-Custom-Token、Cookie等。Cookie需要显式声明，若不声明则严格模式下会被删除（如启用ManageCookies则由jar管理）
 }
 
 type Client struct {
@@ -33,6 +35,9 @@ type Client struct {
 	ClientOption             ClientOption
 	defaultHeaderOrder       []string
 	defaultPseudoHeaderOrder []string
+	strictFingerprint        bool // 严格指纹模式标志
+	specHeaders              http.Header
+	passthroughHeadersLower  map[string]struct{} // 透传header白名单（小写），用于case-insensitive判定
 }
 
 type RequestOption struct {
@@ -125,11 +130,20 @@ func NewClient(ctx g.Ctx, option ...ClientOption) (*Client, error) {
 		return nil, err
 	}
 
+	// 构建透传header白名单（小写）
+	passthroughHeadersLower := make(map[string]struct{}, len(clientOpt.PassthroughHeaders))
+	for _, h := range clientOpt.PassthroughHeaders {
+		passthroughHeadersLower[strings.ToLower(h)] = struct{}{}
+	}
+
 	return &Client{
 		HttpClient:               httpClient,
 		ClientOption:             clientOpt,
 		defaultHeaderOrder:       append([]string(nil), specHeaderOrder...),
 		defaultPseudoHeaderOrder: append([]string(nil), specPseudoHeaderOrder...),
+		strictFingerprint:        clientOpt.StrictFingerprint,
+		specHeaders:              specHeaders,
+		passthroughHeadersLower:  passthroughHeadersLower,
 	}, nil
 }
 
@@ -162,6 +176,38 @@ func headerExistsCaseInsensitive(header http.Header, name string) bool {
 		}
 	}
 	return false
+}
+
+// applyStrictFingerprintHeaders 在严格指纹模式下应用 spec 的 header
+// 会删除客户端不在透传白名单中的 header，然后使用 spec 的 header 替换
+func (c *Client) applyStrictFingerprintHeaders(header http.Header) {
+	if header == nil || !c.strictFingerprint || len(c.specHeaders) == 0 {
+		return
+	}
+
+	// 保存需要透传的客户端 header（白名单中的）
+	passthroughHeaders := make(http.Header)
+	for k, v := range header {
+		lowerK := strings.ToLower(k)
+		if _, ok := c.passthroughHeadersLower[lowerK]; ok {
+			passthroughHeaders[k] = append([]string(nil), v...)
+		}
+	}
+
+	// 清空所有 header
+	for k := range header {
+		header.Del(k)
+	}
+
+	// 使用 spec 的 header
+	for key, values := range c.specHeaders {
+		header[key] = append([]string(nil), values...)
+	}
+
+	// 将白名单中的客户端 header 合并回来（这些 header 会覆盖 spec 的同名项）
+	for key, values := range passthroughHeaders {
+		header[key] = values
+	}
 }
 
 func (c *Client) applyHeaderOrdering(header http.Header) {
@@ -227,6 +273,7 @@ func (c *Client) applyHeaderOrdering(header http.Header) {
 
 // Do 发送HTTP请求
 func (c *Client) Do(ctx g.Ctx, req *http.Request) (*http.Response, error) {
+	c.applyStrictFingerprintHeaders(req.Header)
 	c.applyHeaderOrdering(req.Header)
 	resp, err := c.HttpClient.Do(req)
 	if err != nil {

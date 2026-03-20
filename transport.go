@@ -75,11 +75,16 @@ func (t *FingerprintTransport) RoundTrip(req *stdhttp.Request) (*stdhttp.Respons
 		fReq.Header.Del("Cookie")
 	}
 
-	// 合并默认请求头（不覆盖已有的）
-	defaultHeaders := t.client.defaultHeaders()
-	for key, values := range defaultHeaders {
-		if fReq.Header.Get(key) == "" {
-			fReq.Header[key] = values
+	// 严格指纹模式处理
+	if t.client.strictFingerprint {
+		t.client.applyStrictFingerprintHeaders(fReq.Header)
+	} else {
+		// 原有逻辑：合并默认请求头（不覆盖已有的）
+		defaultHeaders := t.client.defaultHeaders()
+		for key, values := range defaultHeaders {
+			if fReq.Header.Get(key) == "" {
+				fReq.Header[key] = values
+			}
 		}
 	}
 	t.client.applyHeaderOrdering(fReq.Header)

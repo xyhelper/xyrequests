@@ -173,6 +173,93 @@ Transport: client.Transport(true)
 - 忽略客户端传入的 `Cookie`
 - 不向客户端透传上游的 `Set-Cookie`
 
+### Header 处理模式
+
+反向代理时，有两种 header 处理模式：
+
+**1. 混合模式（默认，`StrictFingerprint=false`）**
+- 客户端 header 优先，gospec 的 header 只在缺失时补充
+- 适合通用反代场景
+
+**2. 严格模式（`StrictFingerprint=true`）**
+- 完全使用 gospec 的 header，**覆盖**客户端的同名项
+- 适合需要保持完整指纹一致性的场景（避免客户端修改 header 破坏指纹特征）
+
+该模式下支持**白名单转义**，某些 header（如 `Authorization`）可以设置为始终透传：
+
+```go
+// 启用严格指纹模式，并指定透传白名单
+client, _ := xyrequests.NewClient(ctx, xyrequests.ClientOption{
+    Spec:              "...",
+    StrictFingerprint: true,  // 启用严格指纹
+    PassthroughHeaders: []string{"Authorization", "X-Custom-Token"},  // 这些 header 可以透传
+})
+
+proxy := &httputil.ReverseProxy{
+    Director: func(req *http.Request) {
+        req.URL.Scheme = "https"
+        req.URL.Host = "target-api.example.com"
+        req.Host = "target-api.example.com"
+    },
+    Transport: client.Transport(),
+}
+
+http.ListenAndServe(":8080", proxy)
+```
+
+**严格模式的行为：**
+- 清除客户端的所有 header 和特殊字段
+- 使用 gospec 解析的 header 替换
+- header 顺序按 gospec 指定的顺序
+- 作用范围：Direct HTTP 请求（`Do` 方法） + Transport + WebSocket 三个路径
+
+**白名单转义的行为：**
+- `PassthroughHeaders` 中列举的 header 在严格模式下保留，其值来自客户端（会覆盖 spec 中的同名项）
+- `Cookie` 也需要显式在 `PassthroughHeaders` 中声明才会透传；否则被删除
+- 使用场景：保护 Authorization、业务认证类、跟踪 ID、Cookie 等动态信息
+
+**与 ManageCookies 的配合：**
+- 如果启用 `Transport(true)` 的 `ManageCookies`，客户端的 Cookie 会被删除，Cookie 由 jar 统一管理
+- 如果想同时使用 jar 的 Cookie 和客户端的 Cookie，在 `PassthroughHeaders` 中声明 Cookie，但须确保上游正确处理多个 Cookie
+
+示例场景：
+```go
+// 场景1：使用 jar 管理所有 Cookie（通过 ManageCookies）
+proxy := &httputil.ReverseProxy{
+    Transport: client.Transport(true),  // ManageCookies = true，完全由 jar 管理
+}
+
+// 场景2：保留客户端的 Cookie，但使用 gospec header
+proxy := &httputil.ReverseProxy{
+    Transport: client.Transport(),
+    // 同时在 ClientOption 中
+    PassthroughHeaders: []string{"Cookie"},
+}
+
+// 场景3：混合使用（既用 jar 又透传客户端 Cookie）
+// 注意：这样上游会收到两组 Cookie，需要特殊处理
+proxy := &httputil.ReverseProxy{
+    Transport: client.Transport(true),
+    // ... 但这时客户端的 Cookie 已被删除，所以只有 jar 的 Cookie
+}
+```
+
+示例 - 客户端请求到达反代时（不启用 ManageCookies）：
+```
+客户端请求 Header:
+  User-Agent: Mozilla/...（自定义）      ❌ 被删除，使用 spec 的值
+  Authorization: Bearer xxx              ✅ 保留（在 PassthroughHeaders 中）
+  X-Request-ID: 12345                    ❌ 被删除，不在白名单中
+  Cookie: ...                            ❌ 被删除（未在 PassthroughHeaders 中声明）
+
+最终转发到上游的 Header:
+  User-Agent: Mozilla/...（spec的值）
+  Accept-Language: en-US,en;q=0.9（spec的值）
+  ...（其他 spec header）
+  Authorization: Bearer xxx              ✅ 来自客户端
+  Cookie: ...                            ✅ 来自客户端，或由 ManageCookies 管理
+```
+
 ## WebSocket
 
 ### 1. 直接建立 WebSocket 连接
