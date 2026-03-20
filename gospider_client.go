@@ -11,17 +11,17 @@ import (
 	tls "github.com/bogdanfinn/utls"
 )
 
-// buildProfileFromSpec 从 goSpiderSpec 字符串构建 profiles.ClientProfile 和默认请求头
-func buildProfileFromSpec(goSpiderSpec string) (profiles.ClientProfile, http.Header, error) {
+// buildProfileFromSpec 从 goSpiderSpec 字符串构建 profiles.ClientProfile、默认请求头及其顺序
+func buildProfileFromSpec(goSpiderSpec string) (profiles.ClientProfile, http.Header, []string, []string, error) {
 	parts := strings.Split(goSpiderSpec, "@")
 	if len(parts) != 3 {
-		return profiles.ClientProfile{}, nil, fmt.Errorf("goSpiderSpec 格式错误: 期望3部分, 实际 %d 部分", len(parts))
+		return profiles.ClientProfile{}, nil, nil, nil, fmt.Errorf("goSpiderSpec 格式错误: 期望3部分, 实际 %d 部分", len(parts))
 	}
 
 	// 解码 TLS 原始字节
 	tlsRaw, err := hex.DecodeString(parts[0])
 	if err != nil {
-		return profiles.ClientProfile{}, nil, fmt.Errorf("TLS hex 解码失败: %w", err)
+		return profiles.ClientProfile{}, nil, nil, nil, fmt.Errorf("TLS hex 解码失败: %w", err)
 	}
 
 	// 解码 H2 原始字节并解析
@@ -29,23 +29,25 @@ func buildProfileFromSpec(goSpiderSpec string) (profiles.ClientProfile, http.Hea
 	if parts[2] != "" {
 		h2Raw, err := hex.DecodeString(parts[2])
 		if err != nil {
-			return profiles.ClientProfile{}, nil, fmt.Errorf("H2 hex 解码失败: %w", err)
+			return profiles.ClientProfile{}, nil, nil, nil, fmt.Errorf("H2 hex 解码失败: %w", err)
 		}
 		h2Spec, err = parseH2Spec(h2Raw)
 		if err != nil {
-			return profiles.ClientProfile{}, nil, fmt.Errorf("H2 解析失败: %w", err)
+			return profiles.ClientProfile{}, nil, nil, nil, fmt.Errorf("H2 解析失败: %w", err)
 		}
 	}
 
 	profile, err := buildClientProfile(tlsRaw, h2Spec)
 	if err != nil {
-		return profiles.ClientProfile{}, nil, err
+		return profiles.ClientProfile{}, nil, nil, nil, err
 	}
 
 	// 从 H2 OrderHeaders 提取默认请求头（跳过伪头部）
 	specHeaders := extractDefaultHeaders(h2Spec)
+	headerOrder := extractHeaderOrder(h2Spec)
+	pseudoHeaderOrder := extractPseudoHeaderOrder(h2Spec)
 
-	return profile, specHeaders, nil
+	return profile, specHeaders, headerOrder, pseudoHeaderOrder, nil
 }
 
 // extractDefaultHeaders 从 H2Spec 的 OrderHeaders 中提取非伪头部作为默认请求头
@@ -57,16 +59,57 @@ func extractDefaultHeaders(h2 *H2Spec) http.Header {
 	for _, h := range h2.OrderHeaders {
 		name := h[0]
 		value := h[1]
-		// 跳过伪头部（以 : 开头）
-		if len(name) > 0 && name[0] == ':' {
-			continue
-		}
 		headers.Set(name, value)
 	}
 	if len(headers) == 0 {
 		return nil
 	}
 	return headers
+}
+
+func extractHeaderOrder(h2 *H2Spec) []string {
+	if h2 == nil || len(h2.OrderHeaders) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(h2.OrderHeaders))
+	order := make([]string, 0, len(h2.OrderHeaders))
+	for _, h := range h2.OrderHeaders {
+		if h[0] == "" {
+			continue
+		}
+		name := strings.ToLower(h[0])
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		order = append(order, name)
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	return order
+}
+
+func extractPseudoHeaderOrder(h2 *H2Spec) []string {
+	if h2 == nil || len(h2.PseudoHeaderOrder) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(h2.PseudoHeaderOrder))
+	order := make([]string, 0, len(h2.PseudoHeaderOrder))
+	for _, h := range h2.PseudoHeaderOrder {
+		if h == "" || h[0] != ':' {
+			continue
+		}
+		if _, exists := seen[h]; exists {
+			continue
+		}
+		seen[h] = struct{}{}
+		order = append(order, h)
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	return order
 }
 
 // buildClientProfile 从 TLS 原始字节和 H2 规格构建 profiles.ClientProfile
@@ -144,13 +187,8 @@ func buildH2Params(h2 *H2Spec) (
 
 	connFlow = h2.ConnFlow
 
-	if len(h2.OrderHeaders) > 0 {
-		pseudoHeaderOrder = make([]string, 0, 4)
-		for _, h := range h2.OrderHeaders {
-			if len(h[0]) > 0 && h[0][0] == ':' {
-				pseudoHeaderOrder = append(pseudoHeaderOrder, h[0])
-			}
-		}
+	if len(h2.PseudoHeaderOrder) > 0 {
+		pseudoHeaderOrder = append(pseudoHeaderOrder, h2.PseudoHeaderOrder...)
 	}
 	if len(pseudoHeaderOrder) == 0 {
 		pseudoHeaderOrder = []string{":method", ":authority", ":scheme", ":path"}

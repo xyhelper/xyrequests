@@ -147,6 +147,19 @@ func TestParseGoSpiderSpec(t *testing.T) {
 		t.Errorf("H2 Priority 期望 {Exclusive:true StreamDep:0 Weight:255}, 实际 %+v", spec.H2.Priority)
 	}
 
+	// 验证 H2 伪头顺序
+	expectedPseudoOrder := []string{":method", ":authority", ":scheme", ":path"}
+	t.Logf("H2 PseudoHeaderOrder: %v", spec.H2.PseudoHeaderOrder)
+	if len(spec.H2.PseudoHeaderOrder) != len(expectedPseudoOrder) {
+		t.Errorf("H2 PseudoHeaderOrder 长度期望 %d, 实际 %d", len(expectedPseudoOrder), len(spec.H2.PseudoHeaderOrder))
+	} else {
+		for i, name := range expectedPseudoOrder {
+			if spec.H2.PseudoHeaderOrder[i] != name {
+				t.Errorf("H2 PseudoHeaderOrder[%d] 期望 %s, 实际 %s", i, name, spec.H2.PseudoHeaderOrder[i])
+			}
+		}
+	}
+
 	// 验证 H2 OrderHeaders
 	t.Logf("H2 OrderHeaders 数量: %d", len(spec.H2.OrderHeaders))
 	for i, h := range spec.H2.OrderHeaders {

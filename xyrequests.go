@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sort"
+	"strings"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -27,8 +29,10 @@ type ClientOption struct {
 }
 
 type Client struct {
-	HttpClient   tls_client.HttpClient
-	ClientOption ClientOption
+	HttpClient               tls_client.HttpClient
+	ClientOption             ClientOption
+	defaultHeaderOrder       []string
+	defaultPseudoHeaderOrder []string
 }
 
 type RequestOption struct {
@@ -56,15 +60,19 @@ func NewClient(ctx g.Ctx, option ...ClientOption) (*Client, error) {
 	var profile profiles.ClientProfile
 
 	var specHeaders http.Header
+	var specHeaderOrder []string
+	var specPseudoHeaderOrder []string
 	if len(option) > 0 && option[0].Spec != "" {
 		// 通过 goSpiderSpec 指纹创建自定义 profile
-		p, sh, err := buildProfileFromSpec(option[0].Spec)
+		p, sh, sho, psho, err := buildProfileFromSpec(option[0].Spec)
 		if err != nil {
 			g.Log().Error(ctx, "Failed to build profile from spec:", err)
 			return nil, err
 		}
 		profile = p
 		specHeaders = sh
+		specHeaderOrder = sho
+		specPseudoHeaderOrder = psho
 	} else {
 		profile = profiles.Okhttp4Android12
 		if len(option) > 0 && option[0].ClientProfile != "" {
@@ -118,8 +126,10 @@ func NewClient(ctx g.Ctx, option ...ClientOption) (*Client, error) {
 	}
 
 	return &Client{
-		HttpClient:   httpClient,
-		ClientOption: clientOpt,
+		HttpClient:               httpClient,
+		ClientOption:             clientOpt,
+		defaultHeaderOrder:       append([]string(nil), specHeaderOrder...),
+		defaultPseudoHeaderOrder: append([]string(nil), specPseudoHeaderOrder...),
 	}, nil
 }
 
@@ -145,8 +155,79 @@ func (c *Client) defaultHeaders() http.Header {
 	return dst
 }
 
+func headerExistsCaseInsensitive(header http.Header, name string) bool {
+	for k := range header {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) applyHeaderOrdering(header http.Header) {
+	if header == nil {
+		return
+	}
+
+	if len(c.defaultHeaderOrder) > 0 {
+		seen := make(map[string]struct{}, len(header))
+		order := make([]string, 0, len(header))
+		for _, name := range c.defaultHeaderOrder {
+			lower := strings.ToLower(name)
+			if _, exists := seen[lower]; exists {
+				continue
+			}
+			if !headerExistsCaseInsensitive(header, lower) {
+				continue
+			}
+			seen[lower] = struct{}{}
+			order = append(order, lower)
+		}
+
+		extra := make([]string, 0, len(header))
+		for k := range header {
+			if k == http.HeaderOrderKey || k == http.PHeaderOrderKey {
+				continue
+			}
+			if strings.HasPrefix(k, ":") {
+				continue
+			}
+			lower := strings.ToLower(k)
+			if _, exists := seen[lower]; exists {
+				continue
+			}
+			seen[lower] = struct{}{}
+			extra = append(extra, lower)
+		}
+		sort.Strings(extra)
+		order = append(order, extra...)
+		if len(order) > 0 {
+			header[http.HeaderOrderKey] = order
+		}
+	}
+
+	if len(c.defaultPseudoHeaderOrder) > 0 {
+		pseudo := make([]string, 0, len(c.defaultPseudoHeaderOrder))
+		seenPseudo := make(map[string]struct{}, len(c.defaultPseudoHeaderOrder))
+		for _, name := range c.defaultPseudoHeaderOrder {
+			if !strings.HasPrefix(name, ":") {
+				continue
+			}
+			if _, exists := seenPseudo[name]; exists {
+				continue
+			}
+			seenPseudo[name] = struct{}{}
+			pseudo = append(pseudo, name)
+		}
+		if len(pseudo) > 0 {
+			header[http.PHeaderOrderKey] = pseudo
+		}
+	}
+}
+
 // Do 发送HTTP请求
 func (c *Client) Do(ctx g.Ctx, req *http.Request) (*http.Response, error) {
+	c.applyHeaderOrdering(req.Header)
 	resp, err := c.HttpClient.Do(req)
 	if err != nil {
 		g.Log().Error(ctx, "HTTP request failed:", err)
@@ -307,6 +388,7 @@ func (c *Client) NewWebsocket(ctx g.Ctx, url string, option ...WebsocketOption) 
 			wsOptions = append(wsOptions, tls_client.WithWriteBufferSize(opt.WriteBufferSize))
 		}
 	}
+	c.applyHeaderOrdering(headers)
 	wsOptions = append(wsOptions, tls_client.WithHeaders(headers))
 
 	// 如果客户端配置了CookieJar，传递给WebSocket

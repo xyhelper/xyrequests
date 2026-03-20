@@ -82,6 +82,7 @@ func (t *FingerprintTransport) RoundTrip(req *stdhttp.Request) (*stdhttp.Respons
 			fReq.Header[key] = values
 		}
 	}
+	t.client.applyHeaderOrdering(fReq.Header)
 
 	// 通过 tls-client 发送请求
 	fResp, err := t.client.HttpClient.Do(fReq)

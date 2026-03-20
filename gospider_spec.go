@@ -84,14 +84,15 @@ type h2Header struct {
 
 // H2Spec 表示解析后的 HTTP/2 指纹
 type H2Spec struct {
-	Pri          string      `json:"pri"`
-	Sm           string      `json:"sm"`
-	Settings     []H2Setting `json:"settings"`
-	ConnFlow     uint32      `json:"connFlow"`
-	OrderHeaders [][2]string `json:"orderHeaders"`
-	Priority     H2Priority  `json:"priority"`
-	StreamID     uint32      `json:"-"`
-	Streams      []H2Stream  `json:"streams"`
+	Pri               string      `json:"pri"`
+	Sm                string      `json:"sm"`
+	Settings          []H2Setting `json:"settings"`
+	ConnFlow          uint32      `json:"connFlow"`
+	PseudoHeaderOrder []string    `json:"pseudoHeaderOrder,omitempty"`
+	OrderHeaders      [][2]string `json:"orderHeaders"`
+	Priority          H2Priority  `json:"priority"`
+	StreamID          uint32      `json:"-"`
+	Streams           []H2Stream  `json:"streams"`
 }
 
 // ==================== 主要解析函数 ====================
@@ -579,13 +580,15 @@ func parseH2Spec(raw []byte) (*H2Spec, error) {
 			}
 
 			for _, f := range fields {
-				if !f.IsPseudo() {
-					spec.OrderHeaders = append(spec.OrderHeaders, [2]string{f.Name, f.Value})
-					stream.Headers = append(stream.Headers, h2Header{
-						Name:  f.Name,
-						Value: f.Value,
-					})
+				if f.IsPseudo() {
+					spec.PseudoHeaderOrder = append(spec.PseudoHeaderOrder, f.Name)
+					continue
 				}
+				spec.OrderHeaders = append(spec.OrderHeaders, [2]string{f.Name, f.Value})
+				stream.Headers = append(stream.Headers, h2Header{
+					Name:  f.Name,
+					Value: f.Value,
+				})
 			}
 			spec.Streams = append(spec.Streams, stream)
 			headersFound = true
@@ -641,11 +644,12 @@ func (spec *H2Spec) Map() map[string]any {
 	}
 
 	return map[string]any{
-		"pri":          spec.Pri,
-		"sm":           spec.Sm,
-		"settings":     spec.Settings,
-		"connFlow":     spec.ConnFlow,
-		"orderHeaders": spec.OrderHeaders,
+		"pri":               spec.Pri,
+		"sm":                spec.Sm,
+		"settings":          spec.Settings,
+		"connFlow":          spec.ConnFlow,
+		"pseudoHeaderOrder": spec.PseudoHeaderOrder,
+		"orderHeaders":      spec.OrderHeaders,
 		"priority": map[string]any{
 			"exclusive": spec.Priority.Exclusive,
 			"streamDep": spec.Priority.StreamDep,
