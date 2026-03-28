@@ -1,4 +1,4 @@
-module xyrequests
+module github.com/xyhelper/xyrequests
 
 go 1.24.1
 

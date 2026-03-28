@@ -24,7 +24,7 @@ import (
     "fmt"
     "io"
 
-    "xyrequests"
+    "github.com/xyhelper/xyrequests"
 )
 
 func main() {
