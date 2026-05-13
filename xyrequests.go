@@ -41,10 +41,11 @@ type Client struct {
 }
 
 type RequestOption struct {
-	Headers map[string]string // 自定义请求头
-	Body    []byte            // 请求体
-	Json    any               // JSON数据
-	Proxy   string            // 单次请求代理地址，为空时使用客户端默认代理
+	Headers  map[string]string // 自定义请求头
+	Body     []byte            // 请求体
+	Json     any               // JSON数据
+	Proxy    string            // 单次请求代理地址，为空时使用客户端默认代理
+	MaxRetry int               // 最大重试次数，默认为0不重试
 }
 
 var (
@@ -271,6 +272,29 @@ func (c *Client) applyHeaderOrdering(header http.Header) {
 	}
 }
 
+// doWithRetry 根据 maxRetry 执行请求重试。
+// maxRetry=0 表示仅尝试一次；maxRetry=n 表示最多尝试 n+1 次。
+func (c *Client) doWithRetry(ctx g.Ctx, maxRetry int, doOnce func() (*http.Response, error)) (*http.Response, error) {
+	attempts := maxRetry + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		resp, err := doOnce()
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		g.Log().Error(ctx, "HTTP request failed after retries:", lastErr)
+	}
+	return nil, lastErr
+}
+
 // Do 发送HTTP请求
 func (c *Client) Do(ctx g.Ctx, req *http.Request) (*http.Response, error) {
 	c.applyStrictFingerprintHeaders(req.Header)
@@ -300,107 +324,108 @@ func (c *Client) DoWithProxy(ctx g.Ctx, req *http.Request, proxy string) (*http.
 
 // Get 发送GET请求
 func (c *Client) Get(ctx g.Ctx, url string, option ...RequestOption) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		g.Log().Error(ctx, "Failed to create GET request:", err)
-		return nil, err
-	}
-	req.Header = c.defaultHeaders()
+	opt := RequestOption{}
 	if len(option) > 0 {
-		if option[0].Headers != nil {
-			for key, value := range option[0].Headers {
-				req.Header.Set(key, value)
-			}
-		}
-		if option[0].Proxy != "" {
-			return c.DoWithProxy(ctx, req, option[0].Proxy)
-		}
+		opt = option[0]
 	}
-	return c.Do(ctx, req)
+
+	return c.doWithRetry(ctx, opt.MaxRetry, func() (*http.Response, error) {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			g.Log().Error(ctx, "Failed to create GET request:", err)
+			return nil, err
+		}
+		req.Header = c.defaultHeaders()
+		for key, value := range opt.Headers {
+			req.Header.Set(key, value)
+		}
+		if opt.Proxy != "" {
+			return c.DoWithProxy(ctx, req, opt.Proxy)
+		}
+		return c.Do(ctx, req)
+	})
 }
 
 // Post 发送POST请求
 func (c *Client) Post(ctx g.Ctx, url string, option ...RequestOption) (*http.Response, error) {
-	bodyReader := bytes.NewReader(nil)
+	bodyBytes := []byte(nil)
 	contentType := ""
+	opt := RequestOption{}
 
 	if len(option) > 0 {
-		opt := option[0]
+		opt = option[0]
 		if opt.Json != nil {
 			jsonBytes, err := json.Marshal(opt.Json)
 			if err != nil {
 				g.Log().Error(ctx, "Failed to marshal JSON:", err)
 				return nil, err
 			}
-			bodyReader = bytes.NewReader(jsonBytes)
+			bodyBytes = jsonBytes
 			contentType = "application/json"
 		} else if opt.Body != nil {
-			bodyReader = bytes.NewReader(opt.Body)
+			bodyBytes = opt.Body
 		}
 	}
 
-	req, err := http.NewRequest("POST", url, bodyReader)
-	if err != nil {
-		g.Log().Error(ctx, "Failed to create POST request:", err)
-		return nil, err
-	}
-	req.Header = c.defaultHeaders()
-	if contentType != "" && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	if len(option) > 0 {
-		if option[0].Headers != nil {
-			for key, value := range option[0].Headers {
-				req.Header.Set(key, value)
-			}
+	return c.doWithRetry(ctx, opt.MaxRetry, func() (*http.Response, error) {
+		req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			g.Log().Error(ctx, "Failed to create POST request:", err)
+			return nil, err
 		}
-		if option[0].Proxy != "" {
-			return c.DoWithProxy(ctx, req, option[0].Proxy)
+		req.Header = c.defaultHeaders()
+		if contentType != "" && req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", contentType)
 		}
-	}
-	return c.Do(ctx, req)
+		for key, value := range opt.Headers {
+			req.Header.Set(key, value)
+		}
+		if opt.Proxy != "" {
+			return c.DoWithProxy(ctx, req, opt.Proxy)
+		}
+		return c.Do(ctx, req)
+	})
 }
 
 // DO 转发请求
 func (c *Client) DO(ctx g.Ctx, method string, url string, option ...RequestOption) (*http.Response, error) {
-	bodyReader := bytes.NewReader(nil)
+	bodyBytes := []byte(nil)
 	contentType := ""
+	opt := RequestOption{}
 
 	if len(option) > 0 {
-		opt := option[0]
+		opt = option[0]
 		if opt.Json != nil {
 			jsonBytes, err := json.Marshal(opt.Json)
 			if err != nil {
 				g.Log().Error(ctx, "Failed to marshal JSON:", err)
 				return nil, err
 			}
-			bodyReader = bytes.NewReader(jsonBytes)
+			bodyBytes = jsonBytes
 			contentType = "application/json"
 		} else if opt.Body != nil {
-			bodyReader = bytes.NewReader(opt.Body)
+			bodyBytes = opt.Body
 		}
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		g.Log().Error(ctx, "Failed to create request:", err)
-		return nil, err
-	}
-	req.Header = c.defaultHeaders()
-	if contentType != "" && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	if len(option) > 0 {
-		if option[0].Headers != nil {
-			for key, value := range option[0].Headers {
-				req.Header.Set(key, value)
-			}
+	return c.doWithRetry(ctx, opt.MaxRetry, func() (*http.Response, error) {
+		req, err := http.NewRequest(method, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			g.Log().Error(ctx, "Failed to create request:", err)
+			return nil, err
 		}
-		if option[0].Proxy != "" {
-			return c.DoWithProxy(ctx, req, option[0].Proxy)
+		req.Header = c.defaultHeaders()
+		if contentType != "" && req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", contentType)
 		}
-	}
-	return c.Do(ctx, req)
+		for key, value := range opt.Headers {
+			req.Header.Set(key, value)
+		}
+		if opt.Proxy != "" {
+			return c.DoWithProxy(ctx, req, opt.Proxy)
+		}
+		return c.Do(ctx, req)
+	})
 }
 
 // WebsocketOption WebSocket连接选项
