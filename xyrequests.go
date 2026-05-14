@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -15,19 +18,20 @@ import (
 )
 
 type ClientOption struct {
-	TimeoutSeconds     int         // 超时秒数
-	Proxy              string      // 代理地址
-	NotFollowRedirects bool        // 不跟随重定向
-	CookieJar          *XyJar      // 自定义CookieJar
-	ProxyUrl           string      // 代理URL
-	Closed             bool        // 是否已关闭
-	Debug              bool        // 是否启用调试模式
-	DefaultHeaders     http.Header // 默认请求头
-	ClientProfile      string      // 客户端配置文件名称
-	Spec               string      // goSpiderSpec 指纹字符串，不为空时优先使用
-	ForceHttp1         bool        // 强制使用HTTP/1.1（WebSocket场景需要设为true）
-	StrictFingerprint  bool        // 反向代理严格模式：为true时完全使用gospec的header，覆盖客户端的；为false时客户端header优先（默认）
-	PassthroughHeaders []string    // StrictFingerprint模式下允许透传的header列表。比如Authorization、X-Custom-Token、Cookie等。Cookie需要显式声明，若不声明则严格模式下会被删除（如启用ManageCookies则由jar管理）
+	TimeoutSeconds               int         // 超时秒数（总超时，含 body 读取）。设置 ResponseHeaderTimeoutSeconds 时本字段被忽略。
+	ResponseHeaderTimeoutSeconds int         // 响应头超时秒数：仅限制「发出请求→收到响应头」的时间，body 读取不受限（适合流式/长响应）。设置后 TimeoutSeconds 将被忽略。
+	Proxy                        string      // 代理地址
+	NotFollowRedirects           bool        // 不跟随重定向
+	CookieJar                    *XyJar      // 自定义CookieJar
+	ProxyUrl                     string      // 代理URL
+	Closed                       bool        // 是否已关闭
+	Debug                        bool        // 是否启用调试模式
+	DefaultHeaders               http.Header // 默认请求头
+	ClientProfile                string      // 客户端配置文件名称
+	Spec                         string      // goSpiderSpec 指纹字符串，不为空时优先使用
+	ForceHttp1                   bool        // 强制使用HTTP/1.1（WebSocket场景需要设为true）
+	StrictFingerprint            bool        // 反向代理严格模式：为true时完全使用gospec的header，覆盖客户端的；为false时客户端header优先（默认）
+	PassthroughHeaders           []string    // StrictFingerprint模式下允许透传的header列表。比如Authorization、X-Custom-Token、Cookie等。Cookie需要显式声明，若不声明则严格模式下会被删除（如启用ManageCookies则由jar管理）
 }
 
 type Client struct {
@@ -98,7 +102,10 @@ func NewClient(ctx g.Ctx, option ...ClientOption) (*Client, error) {
 	clientOpt := ClientOption{}
 	if len(option) > 0 {
 		clientOpt = option[0]
-		if clientOpt.TimeoutSeconds > 0 {
+		if clientOpt.ResponseHeaderTimeoutSeconds > 0 {
+			// 禁用总超时，由 doOnce 在响应头阶段单独控制超时
+			options = append(options, tls_client.WithTimeoutSeconds(0))
+		} else if clientOpt.TimeoutSeconds > 0 {
 			options = append(options, tls_client.WithTimeoutSeconds(clientOpt.TimeoutSeconds))
 		}
 		if clientOpt.NotFollowRedirects {
@@ -295,11 +302,65 @@ func (c *Client) doWithRetry(ctx g.Ctx, maxRetry int, doOnce func() (*http.Respo
 	return nil, lastErr
 }
 
+// bodyWithCancel 包装 ReadCloser，在 Close 时调用 cancel 释放请求 context。
+// 用于 ResponseHeaderTimeoutSeconds 模式：收到响应头后 context 保持存活直到 body 关闭。
+type bodyWithCancel struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *bodyWithCancel) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// doOnce 执行一次实际 HTTP 请求。
+// 若设置了 ResponseHeaderTimeoutSeconds，仅对「收到响应头」限时，body 读取不受约束。
+func (c *Client) doOnce(req *http.Request) (*http.Response, error) {
+	headerTimeout := c.ClientOption.ResponseHeaderTimeoutSeconds
+	if headerTimeout <= 0 {
+		return c.HttpClient.Do(req)
+	}
+
+	ctx, cancel := context.WithCancel(req.Context())
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, err := c.HttpClient.Do(req.WithContext(ctx))
+		ch <- result{resp, err}
+	}()
+
+	timer := time.NewTimer(time.Duration(headerTimeout) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			cancel()
+			return nil, r.err
+		}
+		// 收到响应头，将 cancel 推迟到 body 关闭时再调用
+		r.resp.Body = &bodyWithCancel{ReadCloser: r.resp.Body, cancel: cancel}
+		return r.resp, nil
+	case <-timer.C:
+		cancel()
+		return nil, fmt.Errorf("xyrequests: response header timeout after %ds", headerTimeout)
+	case <-req.Context().Done():
+		cancel()
+		return nil, req.Context().Err()
+	}
+}
+
 // Do 发送HTTP请求
 func (c *Client) Do(ctx g.Ctx, req *http.Request) (*http.Response, error) {
 	c.applyStrictFingerprintHeaders(req.Header)
 	c.applyHeaderOrdering(req.Header)
-	resp, err := c.HttpClient.Do(req)
+	resp, err := c.doOnce(req)
 	if err != nil {
 		g.Log().Error(ctx, "HTTP request failed:", err)
 		return nil, err
