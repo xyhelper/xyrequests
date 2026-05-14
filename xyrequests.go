@@ -103,8 +103,11 @@ func NewClient(ctx g.Ctx, option ...ClientOption) (*Client, error) {
 	if len(option) > 0 {
 		clientOpt = option[0]
 		if clientOpt.ResponseHeaderTimeoutSeconds > 0 {
-			// 禁用总超时，由 doOnce 在响应头阶段单独控制超时
-			options = append(options, tls_client.WithTimeoutSeconds(0))
+			// 使用极大值而非 0：WithTimeoutSeconds(0) 会让代理的 connectDialer.Timeout=0，
+			// 导致 deadline=time.Now().Add(0)=time.Now()，代理 CONNECT 握手立即因 deadline 已过而失败。
+			// 极大值对实际使用等同于无超时，doOnce 中的 timer 负责真正的响应头超时控制。
+			const unlimitedSeconds = 365 * 24 * 3600 // 1年≈无超时
+			options = append(options, tls_client.WithTimeoutSeconds(unlimitedSeconds))
 		} else if clientOpt.TimeoutSeconds > 0 {
 			options = append(options, tls_client.WithTimeoutSeconds(clientOpt.TimeoutSeconds))
 		}
