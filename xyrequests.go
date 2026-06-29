@@ -61,6 +61,7 @@ var (
 		"Okhttp4Android13":  profiles.Okhttp4Android13,
 		"ConfirmedAndroid2": profiles.ConfirmedAndroid2,
 		"Chrome_131":        profiles.Chrome_131,
+		"ConfirmedIos":      profiles.ConfirmedIos,
 	}
 )
 
